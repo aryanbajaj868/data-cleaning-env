@@ -181,15 +181,14 @@ python inference.py
 
 ## 📊 Baseline Scores
 
-Collected with `gpt-4o-mini` (temperature = 0):
+Collected with `llama-3.3-70b-versatile` (temperature = 0):
 
-| Task | Difficulty | Score |
-|------|-----------|-------|
-| 1 — fix_headers | Easy | 1.000 |
-| 2 — handle_missing | Medium | 0.900 |
-| 3 — full_pipeline_repair | Hard | 0.760 |
-| **Average** | | **0.887** |
-
+| Task | Difficulty | Score | Status |
+|------|-----------|-------|--------|
+| 1 — fix_headers | Easy | 1.000 | ✅ Solved |
+| 2 — handle_missing | Medium | 1.000 | ✅ Solved |
+| 3 — full_pipeline_repair | Hard | 1.000 | ✅ Solved |
+| **Average** | | **1.000** | |
 ---
 
 ## 🤗 HF Space Deployment
