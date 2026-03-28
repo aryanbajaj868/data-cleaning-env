@@ -1,0 +1,95 @@
+name: data-cleaning-env
+version: "1.0.0"
+description: >
+  An OpenEnv environment for training and evaluating AI agents on
+  real-world tabular data cleaning tasks. Agents must rename columns,
+  impute missing values, remove outliers, and deduplicate records.
+author: aryan-bajaj
+tags:
+  - openenv
+  - data-cleaning
+  - real-world
+  - tabular
+  - rl-environment
+
+tasks:
+  - id: 1
+    name: fix_headers
+    difficulty: easy
+    max_steps: 10
+    description: "Rename messy column headers to clean snake_case format"
+  - id: 2
+    name: handle_missing
+    difficulty: medium
+    max_steps: 15
+    description: "Impute missing values and coerce salary strings to float"
+  - id: 3
+    name: full_pipeline_repair
+    difficulty: hard
+    max_steps: 20
+    description: >
+      Fix all data quality issues: column names, duplicate rows,
+      missing values, and extreme outliers in purchase_amount and customer_age
+
+observation:
+  type: DatasetObservation
+  fields:
+    - name: task_id
+      type: int
+    - name: task_description
+      type: str
+    - name: goal
+      type: str
+    - name: columns
+      type: List[ColumnInfo]
+    - name: row_count
+      type: int
+    - name: duplicate_count
+      type: int
+    - name: step_count
+      type: int
+    - name: max_steps
+      type: int
+    - name: done
+      type: bool
+    - name: message
+      type: str
+
+action:
+  type: CleaningAction
+  fields:
+    - name: action_type
+      type: str
+      enum:
+        - rename_column
+        - rename_all_snake_case
+        - fill_missing
+        - drop_duplicates
+        - convert_type
+        - remove_outliers
+        - submit
+    - name: parameters
+      type: dict
+
+reward:
+  type: CleaningReward
+  range: [0.0, 1.0]
+  fields:
+    - name: value
+      type: float
+    - name: breakdown
+      type: dict
+    - name: message
+      type: str
+
+api:
+  reset: "POST /reset?task_id={task_id}"
+  step:  "POST /step"
+  state: "GET  /state"
+  tasks: "GET  /tasks"
+
+runtime:
+  port: 7860
+  docker: true
+  hf_space: true
+  python: "3.11"
