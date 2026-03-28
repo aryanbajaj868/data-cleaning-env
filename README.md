@@ -166,10 +166,13 @@ docker run -p 7860:7860 data-cleaning-env
 ### Run the baseline agent
 
 ```bash
-export API_BASE_URL=http://localhost:7860
+# Point to your running environment (Local or Hugging Face Space)
+export ENV_URL=http://localhost:7860
+
+# Standard Hackathon Variables for the LLM
+export API_BASE_URL=https://api.openai.com/v1
 export MODEL_NAME=gpt-4o-mini
-export OPENAI_API_KEY=sk-...
-export HF_TOKEN=hf_...
+export HF_TOKEN=sk-...  # Your OpenAI API Key goes here based on their spec
 
 python inference.py
 ```
@@ -213,7 +216,3 @@ Collected with `gpt-4o-mini` (temperature = 0):
 - [x] Baseline runs in < 20 minutes on 2 vCPU / 8 GB RAM
 
 ---
-
-## 📄 License
-
-MIT
