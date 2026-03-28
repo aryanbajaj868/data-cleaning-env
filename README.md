@@ -1,3 +1,14 @@
+---
+title: DataCleaningEnv
+emoji: 🧹
+colorFrom: blue
+colorTo: green
+sdk: docker
+pinned: false
+tags:
+  - openenv
+---
+
 # 🧹 DataCleaningEnv
 
 An **OpenEnv-compliant** reinforcement learning environment where AI agents learn to clean real-world tabular datasets. Agents receive structured observations about messy CSV data and must apply a sequence of cleaning actions to maximise a graded reward signal.
