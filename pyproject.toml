@@ -21,7 +21,7 @@ dependencies = [
 
 [project.scripts]
 # This is the "server entry point" the error mentioned
-data-cleaning-env-server = "server.app:main"
+server = "server.app:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
