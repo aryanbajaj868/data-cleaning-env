@@ -28,7 +28,8 @@ MODEL_NAME: str = os.environ.get("MODEL_NAME", "gpt-4o-mini")
 OPENAI_API_KEY: str = os.environ.get("OPENAI_API_KEY", "")
 HF_TOKEN: str = os.environ.get("HF_TOKEN", "")
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "")
+client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL if OPENAI_BASE_URL else None)
 
 # Extra headers for HF Space authentication (if HF_TOKEN is set)
 HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
