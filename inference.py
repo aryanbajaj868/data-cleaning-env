@@ -1,5 +1,5 @@
 """
-DataCleaningEnv — Improved Inference Script
+DataCleaningEnv — Optimised Inference Script
 """
 
 import json
@@ -15,7 +15,7 @@ from openai import OpenAI
 
 LLM_BASE_URL: str = os.environ.get("API_BASE_URL", "http://localhost:7860").rstrip("/")
 API_KEY: str = os.environ.get("API_KEY", "dummy-key")
-MODEL_NAME: str = os.environ.get("MODEL_NAME", "gpt-4o-mini")
+MODEL_NAME: str = os.environ.get("MODEL_NAME", "gpt-4o")   # upgraded from gpt-4o-mini
 ENV_BASE_URL: str = os.environ.get("ENV_BASE_URL", "http://localhost:7860").rstrip("/")
 HF_TOKEN: str = os.environ.get("HF_TOKEN", "")
 HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
@@ -30,7 +30,7 @@ def make_openai_client() -> OpenAI:
                 "http_proxy", "https_proxy", "all_proxy"):
         os.environ.pop(var, None)
 
-    print(f"INFO: LLM proxy base_url={LLM_BASE_URL}", flush=True)
+    print(f"INFO: LLM proxy base_url={LLM_BASE_URL} model={MODEL_NAME}", flush=True)
 
     for kwargs in ({"mounts": {}}, {"proxies": {}}, {}):
         try:
@@ -44,46 +44,96 @@ def make_openai_client() -> OpenAI:
     return OpenAI(api_key=API_KEY, base_url=LLM_BASE_URL)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Agent system prompt — improved
+# System prompt
 # ─────────────────────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are an expert data cleaning agent working step-by-step on a messy dataset.
+SYSTEM_PROMPT = """You are a world-class data cleaning agent. You are given an observation
+describing a dataset's current state and must choose the single best next action.
 
-Available actions (respond ONLY with valid JSON, no explanation):
-  {"action_type": "rename_all_snake_case", "parameters": {}}
-  {"action_type": "rename_column", "parameters": {"old_name": "...", "new_name": "..."}}
-  {"action_type": "convert_type", "parameters": {"column": "...", "dtype": "float|int|str"}}
-  {"action_type": "fill_missing", "parameters": {"column": "...", "strategy": "mean|median|mode|value", "value": <optional>}}
-  {"action_type": "drop_duplicates", "parameters": {"subset": ["col1", "col2"]}}
-  {"action_type": "remove_outliers", "parameters": {"column": "...", "method": "iqr|cap", "fill": "median|mean"}}
+━━━ AVAILABLE ACTIONS ━━━
+{"action_type": "rename_all_snake_case", "parameters": {}}
+{"action_type": "rename_column", "parameters": {"old_name": "...", "new_name": "..."}}
+{"action_type": "convert_type", "parameters": {"column": "...", "dtype": "float|int|str"}}
+{"action_type": "fill_missing", "parameters": {"column": "...", "strategy": "mean|median|mode|value", "value": <only if strategy=value>}}
+{"action_type": "drop_duplicates", "parameters": {"subset": ["col1", "col2", ...]}}
+{"action_type": "remove_outliers", "parameters": {"column": "...", "method": "iqr|cap", "fill": "median|mean"}}
+{"action_type": "submit", "parameters": {}}
+
+━━━ STRICT EXECUTION ORDER ━━━
+PHASE 1 — RENAME
+  • Always call rename_all_snake_case first, exactly once.
+
+PHASE 2 — TYPE CONVERSION
+  • For every column that contains numeric data stored as strings (e.g. "$1,200", "3.5%", "1,000"):
+    call convert_type with dtype=float or dtype=int.
+  • Do this for ALL such columns before moving on.
+
+PHASE 3 — FILL MISSING VALUES
+  • For every column with missing values:
+    - Numeric column → strategy=median
+    - Categorical/text column → strategy=mode
+  • Handle ALL columns with missing values before moving on.
+
+PHASE 4 — DROP DUPLICATES
+  • Call drop_duplicates once with all column names as subset.
+
+PHASE 5 — REMOVE OUTLIERS
+  • For every numeric column: call remove_outliers with method=iqr, fill=median.
+  • Handle ALL numeric columns before moving on.
+
+PHASE 6 — SUBMIT
+  • Only call submit when ALL of the following are true:
+    - Zero missing values in every column
+    - Zero duplicate rows
+    - All numeric columns have had outliers removed
+  • If any issue remains, go back and fix it first.
+
+━━━ RULES ━━━
+• Respond with ONLY a single JSON object — no explanation, no markdown, no extra text.
+• Never repeat the exact same action consecutively.
+• Never skip a phase.
+• Never submit early.
+• Read the column names from the observation exactly — do not guess or invent column names.
+"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Diagnosis prompt — two-pass approach
+# ─────────────────────────────────────────────────────────────────────────────
+
+DIAGNOSIS_PROMPT = """You are a data cleaning planner. Given the observation below,
+produce a complete ordered cleaning plan as a JSON array of actions to take.
+
+Return ONLY a JSON array like:
+[
+  {"action_type": "rename_all_snake_case", "parameters": {}},
+  {"action_type": "convert_type", "parameters": {"column": "salary", "dtype": "float"}},
+  ...
   {"action_type": "submit", "parameters": {}}
+]
 
-STRICT RULES:
-  1. FIRST action must always be rename_all_snake_case (fixes all column names at once).
-  2. THEN convert any columns that look like numbers but are stored as strings (e.g. "$1,200" → float).
-  3. THEN fill ALL missing values — use median for numeric columns, mode for categorical.
-  4. THEN drop_duplicates using all columns as subset.
-  5. THEN remove_outliers on every numeric column using method=iqr, fill=median.
-  6. ONLY call submit when the observation shows zero missing values, zero duplicates, and all types are correct.
-  7. NEVER call submit if there are still issues remaining in the observation.
-  8. If the last action had no effect (reward did not improve), try a DIFFERENT action on a DIFFERENT column.
-  9. Never repeat the exact same action twice in a row.
-
-Read the observation carefully — it tells you exactly which columns have issues.
+Rules:
+- Start with rename_all_snake_case
+- Convert all string-encoded numeric columns to float/int
+- Fill all missing values (median for numeric, mode for categorical)
+- Drop duplicates
+- Remove outliers from all numeric columns (iqr method, median fill)
+- End with submit
+- Use EXACT column names from the observation
+- Return ONLY valid JSON array, nothing else
 """
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def call_llm(client: OpenAI, messages: list) -> str:
+def call_llm(client: OpenAI, messages: list, max_tokens: int = 500) -> str:
     for attempt in range(3):
         try:
             completion = client.chat.completions.create(
                 model=MODEL_NAME,
                 messages=messages,
                 temperature=0.0,
-                max_tokens=400,
+                max_tokens=max_tokens,
             )
             return completion.choices[0].message.content.strip()
         except Exception as exc:
@@ -93,22 +143,39 @@ def call_llm(client: OpenAI, messages: list) -> str:
 
 def parse_action(raw: str) -> dict | None:
     try:
-        clean = raw
+        clean = raw.strip()
         if "```" in clean:
             clean = clean.split("```")[1]
             if clean.startswith("json\n"):
                 clean = clean[5:]
+        clean = clean.strip()
         return json.loads(clean)
     except (json.JSONDecodeError, IndexError):
         return None
 
 
+def parse_plan(raw: str) -> list:
+    """Parse the diagnosis plan — a JSON array of actions."""
+    try:
+        clean = raw.strip()
+        if "```" in clean:
+            clean = clean.split("```")[1]
+            if clean.startswith("json\n"):
+                clean = clean[5:]
+        clean = clean.strip()
+        result = json.loads(clean)
+        if isinstance(result, list):
+            return result
+    except Exception:
+        pass
+    return []
+
+
 def obs_has_issues(obs: dict) -> bool:
-    """Return True if the observation still reports problems."""
     try:
         issues = obs.get("issues", {})
-        if isinstance(issues, dict):
-            return any(v for v in issues.values())
+        if isinstance(issues, dict) and any(v for v in issues.values()):
+            return True
         stats = obs.get("stats", {})
         missing = stats.get("missing_values", {})
         if any(v > 0 for v in missing.values()):
@@ -117,11 +184,44 @@ def obs_has_issues(obs: dict) -> bool:
             return True
         return False
     except Exception:
-        return True  # assume issues exist if we can't parse
+        return True
+
+
+def get_numeric_columns(obs: dict) -> list:
+    try:
+        dtypes = obs.get("stats", {}).get("dtypes", {})
+        return [col for col, dtype in dtypes.items()
+                if dtype in ("float64", "int64", "float32", "int32", "float", "int")]
+    except Exception:
+        return []
+
+
+def get_missing_columns(obs: dict) -> list:
+    try:
+        missing = obs.get("stats", {}).get("missing_values", {})
+        return [col for col, count in missing.items() if count > 0]
+    except Exception:
+        return []
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Agent loop
+# Two-pass agent: diagnose first, then execute
 # ─────────────────────────────────────────────────────────────────────────────
+
+def diagnose(client: OpenAI, obs: dict) -> list:
+    """Ask the LLM to produce a full cleaning plan upfront."""
+    obs_text = json.dumps(obs, indent=2)
+    print("INFO: Running diagnosis pass...", flush=True)
+    raw = call_llm(client, [
+        {"role": "system", "content": DIAGNOSIS_PROMPT},
+        {"role": "user", "content": f"Observation:\n{obs_text}"},
+    ], max_tokens=1500)
+    plan = parse_plan(raw)
+    if plan:
+        print(f"INFO: Plan has {len(plan)} steps: {[a.get('action_type') for a in plan]}", flush=True)
+    else:
+        print("WARN: Diagnosis failed, falling back to reactive mode.", flush=True)
+    return plan
+
 
 def run_agent_on_task(task_id: int, client: OpenAI):
     resp = requests.post(
@@ -130,60 +230,88 @@ def run_agent_on_task(task_id: int, client: OpenAI):
     resp.raise_for_status()
     obs = resp.json()
 
+    print(f"INFO: task={task_id} obs_keys={list(obs.keys())}", flush=True)
+    print(f"INFO: task={task_id} stats={json.dumps(obs.get('stats', {}), indent=2)}", flush=True)
+
     max_steps = obs["max_steps"]
-    conversation = []
     final_score = 0.001
     steps_taken = 0
     prev_score = 0.0
     stall_count = 0
     last_action = None
 
+    # ── Pass 1: Diagnosis ──
+    plan = diagnose(client, obs)
+    plan_index = 0
+
+    # ── Pass 2: Execute ──
+    conversation = []
+
     for step_num in range(max_steps):
-        obs_text = json.dumps(obs, indent=2)
 
-        # Build user message with extra context on stalls
-        user_content = f"Current observation:\n{obs_text}"
-        if stall_count >= 2:
-            user_content += (
-                "\n\nWARNING: Your last actions did not improve the score. "
-                "Try a completely different action on a column you have not touched yet."
-            )
+        # Try plan-based action first
+        action_dict = None
+        if plan and plan_index < len(plan):
+            candidate = plan[plan_index]
+            if candidate != last_action:
+                action_dict = candidate
+                plan_index += 1
+                print(f"INFO: Using planned action {plan_index}/{len(plan)}", flush=True)
+            else:
+                plan_index += 1  # skip duplicate
 
-        conversation.append({"role": "user", "content": user_content})
-
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}] + conversation
-        raw = call_llm(client, messages)
-        if not raw:
-            continue
-
-        conversation.append({"role": "assistant", "content": raw})
-        action_dict = parse_action(raw)
+        # Fall back to reactive LLM if plan is exhausted or repeated
         if not action_dict:
-            print(f"WARN: Could not parse action from: {raw[:80]}", flush=True)
-            continue
+            obs_text = json.dumps(obs, indent=2)
+            user_content = f"Current observation:\n{obs_text}"
+            if stall_count >= 2:
+                user_content += (
+                    "\n\nWARNING: Score is not improving. "
+                    "Try a completely different action on a column not yet cleaned."
+                )
+            conversation.append({"role": "user", "content": user_content})
+            messages = [{"role": "system", "content": SYSTEM_PROMPT}] + conversation
+            raw = call_llm(client, messages)
+            if not raw:
+                continue
+            conversation.append({"role": "assistant", "content": raw})
+            action_dict = parse_action(raw)
+            if not action_dict:
+                print(f"WARN: Could not parse: {raw[:80]}", flush=True)
+                continue
 
         action_type = action_dict.get("action_type")
 
-        # Guard: don't submit if obs still has issues
+        # Guard: block premature submit
         if action_type == "submit" and obs_has_issues(obs):
-            print("WARN: Agent tried to submit with issues remaining — blocking submit.", flush=True)
+            print("WARN: Blocking premature submit — issues remain.", flush=True)
+            if plan:
+                # inject fix steps into plan
+                missing_cols = get_missing_columns(obs)
+                numeric_cols = get_numeric_columns(obs)
+                extra = []
+                for col in missing_cols:
+                    extra.append({"action_type": "fill_missing",
+                                  "parameters": {"column": col, "strategy": "median"}})
+                for col in numeric_cols:
+                    extra.append({"action_type": "remove_outliers",
+                                  "parameters": {"column": col, "method": "iqr", "fill": "median"}})
+                extra.append({"action_type": "submit", "parameters": {}})
+                plan = plan[:plan_index] + extra
             conversation.append({
                 "role": "user",
-                "content": "DO NOT submit yet. The observation still shows issues. Fix them first."
+                "content": "DO NOT submit yet — issues remain. Fix all missing values and outliers first."
             })
             continue
 
-        # Guard: don't repeat same action twice in a row
+        # Guard: block exact repeat
         if action_dict == last_action:
-            print("WARN: Repeated action blocked — forcing different approach.", flush=True)
-            conversation.append({
-                "role": "user",
-                "content": "That action was already tried. Choose a DIFFERENT action on a different column."
-            })
+            print("WARN: Blocking repeated action.", flush=True)
+            plan_index += 1
             continue
 
         steps_taken = step_num + 1
-        print(f"[STEP] step={steps_taken} action={action_type}", flush=True)
+        print(f"[STEP] step={steps_taken} action={action_type} params={action_dict.get('parameters', {})}", flush=True)
 
         try:
             step_resp = requests.post(
@@ -206,7 +334,6 @@ def run_agent_on_task(task_id: int, client: OpenAI):
 
         print(f"[STEP] step={steps_taken} reward={final_score}", flush=True)
 
-        # Track stalls
         if final_score <= prev_score:
             stall_count += 1
         else:
