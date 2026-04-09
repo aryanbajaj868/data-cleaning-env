@@ -7,41 +7,49 @@ import os
 import sys
 
 import requests
+from openai import OpenAI
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Configuration
 # ─────────────────────────────────────────────────────────────────────────────
 
-API_BASE_URL: str = os.getenv("API_BASE_URL", "http://localhost:7860").rstrip("/")
-MODEL_NAME: str = os.getenv("MODEL_NAME", "gpt-4o-mini")
-OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "dummy-key")
-HF_TOKEN: str = os.getenv("HF_TOKEN")
+# LiteLLM proxy — injected by the hackathon platform
+LLM_BASE_URL: str = os.environ.get("API_BASE_URL", "http://localhost:7860").rstrip("/")
+API_KEY: str = os.environ.get("API_KEY", "dummy-key")
+MODEL_NAME: str = os.environ.get("MODEL_NAME", "gpt-4o-mini")
 
+# Data-cleaning environment — runs on a fixed local port inside the container
+ENV_BASE_URL: str = os.environ.get("ENV_BASE_URL", "http://localhost:7860").rstrip("/")
+
+HF_TOKEN: str = os.environ.get("HF_TOKEN", "")
 HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Safe OpenAI client initialisation — handles all httpx versions
+# OpenAI client — must use the hackathon LiteLLM proxy
 # ─────────────────────────────────────────────────────────────────────────────
 
-def make_openai_client():
-    from openai import OpenAI
+def make_openai_client() -> OpenAI:
     import httpx
 
+    # Clear any proxy env vars that might break httpx
     for var in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
                 "http_proxy", "https_proxy", "all_proxy"):
         os.environ.pop(var, None)
 
-    try:
-        return OpenAI(api_key=OPENAI_API_KEY, http_client=httpx.Client(mounts={}, timeout=60.0))
-    except TypeError:
-        pass
+    print(f"INFO: LLM proxy base_url={LLM_BASE_URL}", flush=True)
 
-    try:
-        return OpenAI(api_key=OPENAI_API_KEY, http_client=httpx.Client(proxies={}, timeout=60.0))
-    except TypeError:
-        pass
+    for mounts_arg in ({"mounts": {}}, {"proxies": {}}, {}):
+        try:
+            http_client = httpx.Client(timeout=60.0, **mounts_arg)
+            return OpenAI(
+                api_key=API_KEY,           # hackathon-injected key
+                base_url=LLM_BASE_URL,     # hackathon LiteLLM proxy
+                http_client=http_client,
+            )
+        except TypeError:
+            continue
 
-    return OpenAI(api_key=OPENAI_API_KEY)
+    return OpenAI(api_key=API_KEY, base_url=LLM_BASE_URL)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -76,9 +84,9 @@ Always respond with ONLY valid JSON:
 # Agent loop
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_agent_on_task(task_id: int, client):
+def run_agent_on_task(task_id: int, client: OpenAI):
     resp = requests.post(
-        f"{API_BASE_URL}/reset", params={"task_id": task_id}, headers=HEADERS, timeout=30
+        f"{ENV_BASE_URL}/reset", params={"task_id": task_id}, headers=HEADERS, timeout=30
     )
     resp.raise_for_status()
     obs = resp.json()
@@ -117,13 +125,11 @@ def run_agent_on_task(task_id: int, client):
             continue
 
         steps_taken = step_num + 1
-
-        # ── STEP log — required format with square brackets ──
         print(f"[STEP] step={steps_taken} action={action_dict.get('action_type')}", flush=True)
 
         try:
             step_resp = requests.post(
-                f"{API_BASE_URL}/step",
+                f"{ENV_BASE_URL}/step",
                 json=action_dict,
                 headers=HEADERS,
                 timeout=30,
@@ -152,6 +158,7 @@ def run_agent_on_task(task_id: int, client):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
+    # 1. Build OpenAI client pointed at hackathon proxy
     try:
         client = make_openai_client()
         print("INFO: OpenAI client initialised successfully", flush=True)
@@ -159,18 +166,18 @@ def main():
         print(f"ERROR: OpenAI client init failed — {type(exc).__name__}: {exc}", flush=True)
         sys.exit(1)
 
+    # 2. Verify cleaning environment is reachable
     try:
-        ping = requests.get(f"{API_BASE_URL}/", headers=HEADERS, timeout=15)
+        ping = requests.get(f"{ENV_BASE_URL}/", headers=HEADERS, timeout=15)
         ping.raise_for_status()
-        print(f"INFO: Environment reachable at {API_BASE_URL}", flush=True)
+        print(f"INFO: Environment reachable at {ENV_BASE_URL}", flush=True)
     except Exception as exc:
-        print(f"ERROR: Cannot reach environment at {API_BASE_URL}: {exc}", flush=True)
+        print(f"ERROR: Cannot reach environment at {ENV_BASE_URL}: {exc}", flush=True)
         sys.exit(1)
 
     scores = {}
 
     for task_id in [1, 2, 3]:
-        # ── START log — required format with square brackets ──
         print(f"[START] task={task_id}", flush=True)
 
         try:
@@ -180,8 +187,6 @@ def main():
             score, steps = 0.0, 0
 
         scores[task_id] = score
-
-        # ── END log — required format with square brackets + steps count ──
         print(f"[END] task={task_id} score={score} steps={steps}", flush=True)
 
     avg = sum(scores.values()) / len(scores)
