@@ -6,6 +6,7 @@ import json
 import os
 import sys
 
+import httpx
 import requests
 from openai import OpenAI
 
@@ -19,8 +20,6 @@ OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "dummy-key")
 HF_TOKEN: str = os.getenv("HF_TOKEN")  # no default — required by spec
 
 HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
-
-client = OpenAI(api_key=OPENAI_API_KEY)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Agent system prompt
@@ -54,7 +53,7 @@ Always respond with ONLY valid JSON:
 # Agent loop
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_agent_on_task(task_id: int) -> float:
+def run_agent_on_task(task_id: int, client: OpenAI) -> float:
     # Reset environment
     resp = requests.post(
         f"{API_BASE_URL}/reset", params={"task_id": task_id}, headers=HEADERS, timeout=30
@@ -121,7 +120,20 @@ def run_agent_on_task(task_id: int) -> float:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    # Verify environment is reachable
+    # ── 1. Initialise OpenAI client with proxy isolation ──
+    try:
+        client = OpenAI(
+            api_key=OPENAI_API_KEY,
+            http_client=httpx.Client(
+                proxies={},      # prevents HTTP_PROXY env vars from breaking init
+                timeout=60.0,
+            ),
+        )
+    except Exception as exc:
+        print(f"ERROR: OpenAI client init failed — {type(exc).__name__}: {exc}")
+        sys.exit(1)
+
+    # ── 2. Verify environment is reachable ──
     try:
         ping = requests.get(f"{API_BASE_URL}/", headers=HEADERS, timeout=15)
         ping.raise_for_status()
@@ -136,7 +148,7 @@ def main():
         print(f"START task={task_id}")
         sys.stdout.flush()
 
-        score = run_agent_on_task(task_id)
+        score = run_agent_on_task(task_id, client)
         scores[task_id] = score
 
         # ── END log (required structured format) ──
