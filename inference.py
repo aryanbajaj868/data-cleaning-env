@@ -145,12 +145,13 @@ def run_agent_on_task(task_id: int, client: OpenAI):
         done = result["done"]
         raw_score = float(reward["value"])
         final_score = max(0.001, min(0.999, raw_score))
+
         print(f"[STEP] step={steps_taken} reward={final_score}", flush=True)
 
         if done:
             break
 
-    return final_score, steps_taken
+    return max(0.001, min(0.999, final_score)), steps_taken
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -184,7 +185,7 @@ def main():
             score, steps = run_agent_on_task(task_id, client)
         except Exception as exc:
             print(f"ERROR: task={task_id} crashed — {type(exc).__name__}: {exc}", flush=True)
-            score, steps = 0.0, 0
+            score, steps = 0.001, 0
 
         scores[task_id] = score
         print(f"[END] task={task_id} score={score} steps={steps}", flush=True)
