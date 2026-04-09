@@ -143,8 +143,8 @@ def run_agent_on_task(task_id: int, client: OpenAI):
         obs = result["observation"]
         reward = result["reward"]
         done = result["done"]
-        final_score = float(reward["value"])
-
+        raw_score = float(reward["value"])
+        final_score = max(0.001, min(0.999, raw_score))
         print(f"[STEP] step={steps_taken} reward={final_score}", flush=True)
 
         if done:
