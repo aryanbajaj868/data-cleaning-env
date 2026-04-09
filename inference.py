@@ -6,9 +6,7 @@ import json
 import os
 import sys
 
-import httpx
 import requests
-from openai import OpenAI
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Configuration — exactly as required by the hackathon spec
@@ -20,6 +18,37 @@ OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "dummy-key")
 HF_TOKEN: str = os.getenv("HF_TOKEN")  # no default — required by spec
 
 HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Safe OpenAI client initialisation — handles all httpx versions
+# ─────────────────────────────────────────────────────────────────────────────
+
+def make_openai_client():
+    from openai import OpenAI
+    import httpx
+
+    # Remove ALL proxy-related env vars before init so httpx doesn't choke
+    for var in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+                "http_proxy", "https_proxy", "all_proxy"):
+        os.environ.pop(var, None)
+
+    # httpx 0.28+ removed `proxies=`, uses `mounts=` instead
+    # Try mounts= first, fall back to plain client
+    try:
+        http_client = httpx.Client(mounts={}, timeout=60.0)
+        return OpenAI(api_key=OPENAI_API_KEY, http_client=http_client)
+    except TypeError:
+        pass
+
+    try:
+        http_client = httpx.Client(proxies={}, timeout=60.0)
+        return OpenAI(api_key=OPENAI_API_KEY, http_client=http_client)
+    except TypeError:
+        pass
+
+    # Last resort — plain client, proxy env vars already cleared above
+    return OpenAI(api_key=OPENAI_API_KEY)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Agent system prompt
@@ -53,7 +82,7 @@ Always respond with ONLY valid JSON:
 # Agent loop
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_agent_on_task(task_id: int, client: OpenAI) -> float:
+def run_agent_on_task(task_id: int, client) -> float:
     # Reset environment
     resp = requests.post(
         f"{API_BASE_URL}/reset", params={"task_id": task_id}, headers=HEADERS, timeout=30
@@ -69,13 +98,19 @@ def run_agent_on_task(task_id: int, client: OpenAI) -> float:
         obs_text = json.dumps(obs, indent=2)
         conversation.append({"role": "user", "content": f"Current observation:\n{obs_text}"})
 
-        completion = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[{"role": "system", "content": SYSTEM_PROMPT}] + conversation,
-            temperature=0.0,
-            max_tokens=300,
-        )
-        raw = completion.choices[0].message.content.strip()
+        try:
+            completion = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=[{"role": "system", "content": SYSTEM_PROMPT}] + conversation,
+                temperature=0.0,
+                max_tokens=300,
+            )
+            raw = completion.choices[0].message.content.strip()
+        except Exception as exc:
+            print(f"WARN: LLM call failed at step {step_num + 1}: {exc}")
+            sys.stdout.flush()
+            continue
+
         conversation.append({"role": "assistant", "content": raw})
 
         try:
@@ -92,14 +127,19 @@ def run_agent_on_task(task_id: int, client: OpenAI) -> float:
         print(f"STEP task={task_id} step={step_num + 1} action={action_dict.get('action_type')}")
         sys.stdout.flush()
 
-        step_resp = requests.post(
-            f"{API_BASE_URL}/step",
-            json=action_dict,
-            headers=HEADERS,
-            timeout=30,
-        )
-        step_resp.raise_for_status()
-        result = step_resp.json()
+        try:
+            step_resp = requests.post(
+                f"{API_BASE_URL}/step",
+                json=action_dict,
+                headers=HEADERS,
+                timeout=30,
+            )
+            step_resp.raise_for_status()
+            result = step_resp.json()
+        except Exception as exc:
+            print(f"WARN: step request failed: {exc}")
+            sys.stdout.flush()
+            break
 
         obs = result["observation"]
         reward = result["reward"]
@@ -120,15 +160,11 @@ def run_agent_on_task(task_id: int, client: OpenAI) -> float:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    # ── 1. Initialise OpenAI client with proxy isolation ──
+    # ── 1. Initialise OpenAI client ──
     try:
-        client = OpenAI(
-            api_key=OPENAI_API_KEY,
-            http_client=httpx.Client(
-                proxies={},      # prevents HTTP_PROXY env vars from breaking init
-                timeout=60.0,
-            ),
-        )
+        client = make_openai_client()
+        print("INFO: OpenAI client initialised successfully")
+        sys.stdout.flush()
     except Exception as exc:
         print(f"ERROR: OpenAI client init failed — {type(exc).__name__}: {exc}")
         sys.exit(1)
@@ -137,6 +173,8 @@ def main():
     try:
         ping = requests.get(f"{API_BASE_URL}/", headers=HEADERS, timeout=15)
         ping.raise_for_status()
+        print(f"INFO: Environment reachable at {API_BASE_URL}")
+        sys.stdout.flush()
     except Exception as exc:
         print(f"ERROR: Cannot reach environment at {API_BASE_URL}: {exc}")
         sys.exit(1)
@@ -148,7 +186,13 @@ def main():
         print(f"START task={task_id}")
         sys.stdout.flush()
 
-        score = run_agent_on_task(task_id, client)
+        try:
+            score = run_agent_on_task(task_id, client)
+        except Exception as exc:
+            print(f"ERROR: task={task_id} crashed — {type(exc).__name__}: {exc}")
+            sys.stdout.flush()
+            score = 0.0
+
         scores[task_id] = score
 
         # ── END log (required structured format) ──
