@@ -9,13 +9,13 @@ import sys
 import requests
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Configuration — exactly as required by the hackathon spec
+# Configuration
 # ─────────────────────────────────────────────────────────────────────────────
 
 API_BASE_URL: str = os.getenv("API_BASE_URL", "http://localhost:7860").rstrip("/")
 MODEL_NAME: str = os.getenv("MODEL_NAME", "gpt-4o-mini")
 OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "dummy-key")
-HF_TOKEN: str = os.getenv("HF_TOKEN")  # no default — required by spec
+HF_TOKEN: str = os.getenv("HF_TOKEN")
 
 HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
 
@@ -27,26 +27,20 @@ def make_openai_client():
     from openai import OpenAI
     import httpx
 
-    # Remove ALL proxy-related env vars before init so httpx doesn't choke
     for var in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
                 "http_proxy", "https_proxy", "all_proxy"):
         os.environ.pop(var, None)
 
-    # httpx 0.28+ removed `proxies=`, uses `mounts=` instead
-    # Try mounts= first, fall back to plain client
     try:
-        http_client = httpx.Client(mounts={}, timeout=60.0)
-        return OpenAI(api_key=OPENAI_API_KEY, http_client=http_client)
+        return OpenAI(api_key=OPENAI_API_KEY, http_client=httpx.Client(mounts={}, timeout=60.0))
     except TypeError:
         pass
 
     try:
-        http_client = httpx.Client(proxies={}, timeout=60.0)
-        return OpenAI(api_key=OPENAI_API_KEY, http_client=http_client)
+        return OpenAI(api_key=OPENAI_API_KEY, http_client=httpx.Client(proxies={}, timeout=60.0))
     except TypeError:
         pass
 
-    # Last resort — plain client, proxy env vars already cleared above
     return OpenAI(api_key=OPENAI_API_KEY)
 
 
@@ -82,8 +76,7 @@ Always respond with ONLY valid JSON:
 # Agent loop
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_agent_on_task(task_id: int, client) -> float:
-    # Reset environment
+def run_agent_on_task(task_id: int, client):
     resp = requests.post(
         f"{API_BASE_URL}/reset", params={"task_id": task_id}, headers=HEADERS, timeout=30
     )
@@ -93,6 +86,7 @@ def run_agent_on_task(task_id: int, client) -> float:
     max_steps = obs["max_steps"]
     conversation = []
     final_score = 0.0
+    steps_taken = 0
 
     for step_num in range(max_steps):
         obs_text = json.dumps(obs, indent=2)
@@ -107,8 +101,7 @@ def run_agent_on_task(task_id: int, client) -> float:
             )
             raw = completion.choices[0].message.content.strip()
         except Exception as exc:
-            print(f"WARN: LLM call failed at step {step_num + 1}: {exc}")
-            sys.stdout.flush()
+            print(f"WARN: LLM call failed at step {step_num + 1}: {exc}", flush=True)
             continue
 
         conversation.append({"role": "assistant", "content": raw})
@@ -123,9 +116,10 @@ def run_agent_on_task(task_id: int, client) -> float:
         except (json.JSONDecodeError, IndexError):
             continue
 
-        # ── STEP log (required structured format) ──
-        print(f"STEP task={task_id} step={step_num + 1} action={action_dict.get('action_type')}")
-        sys.stdout.flush()
+        steps_taken = step_num + 1
+
+        # ── STEP log — required format with square brackets ──
+        print(f"[STEP] step={steps_taken} action={action_dict.get('action_type')}", flush=True)
 
         try:
             step_resp = requests.post(
@@ -137,8 +131,7 @@ def run_agent_on_task(task_id: int, client) -> float:
             step_resp.raise_for_status()
             result = step_resp.json()
         except Exception as exc:
-            print(f"WARN: step request failed: {exc}")
-            sys.stdout.flush()
+            print(f"WARN: step request failed: {exc}", flush=True)
             break
 
         obs = result["observation"]
@@ -146,13 +139,12 @@ def run_agent_on_task(task_id: int, client) -> float:
         done = result["done"]
         final_score = float(reward["value"])
 
-        print(f"STEP task={task_id} step={step_num + 1} reward={final_score}")
-        sys.stdout.flush()
+        print(f"[STEP] step={steps_taken} reward={final_score}", flush=True)
 
         if done:
             break
 
-    return final_score
+    return final_score, steps_taken
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -160,48 +152,40 @@ def run_agent_on_task(task_id: int, client) -> float:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    # ── 1. Initialise OpenAI client ──
     try:
         client = make_openai_client()
-        print("INFO: OpenAI client initialised successfully")
-        sys.stdout.flush()
+        print("INFO: OpenAI client initialised successfully", flush=True)
     except Exception as exc:
-        print(f"ERROR: OpenAI client init failed — {type(exc).__name__}: {exc}")
+        print(f"ERROR: OpenAI client init failed — {type(exc).__name__}: {exc}", flush=True)
         sys.exit(1)
 
-    # ── 2. Verify environment is reachable ──
     try:
         ping = requests.get(f"{API_BASE_URL}/", headers=HEADERS, timeout=15)
         ping.raise_for_status()
-        print(f"INFO: Environment reachable at {API_BASE_URL}")
-        sys.stdout.flush()
+        print(f"INFO: Environment reachable at {API_BASE_URL}", flush=True)
     except Exception as exc:
-        print(f"ERROR: Cannot reach environment at {API_BASE_URL}: {exc}")
+        print(f"ERROR: Cannot reach environment at {API_BASE_URL}: {exc}", flush=True)
         sys.exit(1)
 
     scores = {}
 
     for task_id in [1, 2, 3]:
-        # ── START log (required structured format) ──
-        print(f"START task={task_id}")
-        sys.stdout.flush()
+        # ── START log — required format with square brackets ──
+        print(f"[START] task={task_id}", flush=True)
 
         try:
-            score = run_agent_on_task(task_id, client)
+            score, steps = run_agent_on_task(task_id, client)
         except Exception as exc:
-            print(f"ERROR: task={task_id} crashed — {type(exc).__name__}: {exc}")
-            sys.stdout.flush()
-            score = 0.0
+            print(f"ERROR: task={task_id} crashed — {type(exc).__name__}: {exc}", flush=True)
+            score, steps = 0.0, 0
 
         scores[task_id] = score
 
-        # ── END log (required structured format) ──
-        print(f"END task={task_id} score={score}")
-        sys.stdout.flush()
+        # ── END log — required format with square brackets + steps count ──
+        print(f"[END] task={task_id} score={score} steps={steps}", flush=True)
 
     avg = sum(scores.values()) / len(scores)
-    print(f"DONE average_score={avg:.3f}")
-    sys.stdout.flush()
+    print(f"DONE average_score={avg:.3f}", flush=True)
 
 
 if __name__ == "__main__":
