@@ -1,5 +1,5 @@
 """
-DataCleaningEnv — Baseline Inference Script
+DataCleaningEnv — Improved Inference Script
 """
 
 import json
@@ -13,72 +13,111 @@ from openai import OpenAI
 # Configuration
 # ─────────────────────────────────────────────────────────────────────────────
 
-# LiteLLM proxy — injected by the hackathon platform
 LLM_BASE_URL: str = os.environ.get("API_BASE_URL", "http://localhost:7860").rstrip("/")
 API_KEY: str = os.environ.get("API_KEY", "dummy-key")
 MODEL_NAME: str = os.environ.get("MODEL_NAME", "gpt-4o-mini")
-
-# Data-cleaning environment — runs on a fixed local port inside the container
 ENV_BASE_URL: str = os.environ.get("ENV_BASE_URL", "http://localhost:7860").rstrip("/")
-
 HF_TOKEN: str = os.environ.get("HF_TOKEN", "")
 HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
 
 # ─────────────────────────────────────────────────────────────────────────────
-# OpenAI client — must use the hackathon LiteLLM proxy
+# OpenAI client — routed through hackathon LiteLLM proxy
 # ─────────────────────────────────────────────────────────────────────────────
 
 def make_openai_client() -> OpenAI:
     import httpx
-
-    # Clear any proxy env vars that might break httpx
     for var in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
                 "http_proxy", "https_proxy", "all_proxy"):
         os.environ.pop(var, None)
 
     print(f"INFO: LLM proxy base_url={LLM_BASE_URL}", flush=True)
 
-    for mounts_arg in ({"mounts": {}}, {"proxies": {}}, {}):
+    for kwargs in ({"mounts": {}}, {"proxies": {}}, {}):
         try:
-            http_client = httpx.Client(timeout=60.0, **mounts_arg)
             return OpenAI(
-                api_key=API_KEY,           # hackathon-injected key
-                base_url=LLM_BASE_URL,     # hackathon LiteLLM proxy
-                http_client=http_client,
+                api_key=API_KEY,
+                base_url=LLM_BASE_URL,
+                http_client=httpx.Client(timeout=60.0, **kwargs),
             )
         except TypeError:
             continue
-
     return OpenAI(api_key=API_KEY, base_url=LLM_BASE_URL)
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-# Agent system prompt
+# Agent system prompt — improved
 # ─────────────────────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are an expert data cleaning agent. You receive observations
-describing a messy dataset and must apply structured actions to clean it.
+SYSTEM_PROMPT = """You are an expert data cleaning agent working step-by-step on a messy dataset.
 
-Available action types and their parameters:
-  rename_column          {"old_name": "...", "new_name": "..."}
-  rename_all_snake_case  {}
-  fill_missing           {"column": "...", "strategy": "mean|median|mode|value", "value": <optional>}
-  drop_duplicates        {"subset": ["col1", "col2"]}
-  convert_type           {"column": "...", "dtype": "float|int|str"}
-  remove_outliers        {"column": "...", "method": "iqr|cap", "fill": "median|mean"}
-  submit                 {}
+Available actions (respond ONLY with valid JSON, no explanation):
+  {"action_type": "rename_all_snake_case", "parameters": {}}
+  {"action_type": "rename_column", "parameters": {"old_name": "...", "new_name": "..."}}
+  {"action_type": "convert_type", "parameters": {"column": "...", "dtype": "float|int|str"}}
+  {"action_type": "fill_missing", "parameters": {"column": "...", "strategy": "mean|median|mode|value", "value": <optional>}}
+  {"action_type": "drop_duplicates", "parameters": {"subset": ["col1", "col2"]}}
+  {"action_type": "remove_outliers", "parameters": {"column": "...", "method": "iqr|cap", "fill": "median|mean"}}
+  {"action_type": "submit", "parameters": {}}
 
-Strategy:
-  1. Fix column names first (use rename_all_snake_case).
-  2. Convert types (e.g. salary strings to float).
-  3. Fill all missing values.
-  4. Drop duplicates.
-  5. Remove outliers.
-  6. Call submit when done.
+STRICT RULES:
+  1. FIRST action must always be rename_all_snake_case (fixes all column names at once).
+  2. THEN convert any columns that look like numbers but are stored as strings (e.g. "$1,200" → float).
+  3. THEN fill ALL missing values — use median for numeric columns, mode for categorical.
+  4. THEN drop_duplicates using all columns as subset.
+  5. THEN remove_outliers on every numeric column using method=iqr, fill=median.
+  6. ONLY call submit when the observation shows zero missing values, zero duplicates, and all types are correct.
+  7. NEVER call submit if there are still issues remaining in the observation.
+  8. If the last action had no effect (reward did not improve), try a DIFFERENT action on a DIFFERENT column.
+  9. Never repeat the exact same action twice in a row.
 
-Always respond with ONLY valid JSON:
-{"action_type": "...", "parameters": {...}}
+Read the observation carefully — it tells you exactly which columns have issues.
 """
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def call_llm(client: OpenAI, messages: list) -> str:
+    for attempt in range(3):
+        try:
+            completion = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=messages,
+                temperature=0.0,
+                max_tokens=400,
+            )
+            return completion.choices[0].message.content.strip()
+        except Exception as exc:
+            print(f"WARN: LLM attempt {attempt+1} failed: {exc}", flush=True)
+    return ""
+
+
+def parse_action(raw: str) -> dict | None:
+    try:
+        clean = raw
+        if "```" in clean:
+            clean = clean.split("```")[1]
+            if clean.startswith("json\n"):
+                clean = clean[5:]
+        return json.loads(clean)
+    except (json.JSONDecodeError, IndexError):
+        return None
+
+
+def obs_has_issues(obs: dict) -> bool:
+    """Return True if the observation still reports problems."""
+    try:
+        issues = obs.get("issues", {})
+        if isinstance(issues, dict):
+            return any(v for v in issues.values())
+        stats = obs.get("stats", {})
+        missing = stats.get("missing_values", {})
+        if any(v > 0 for v in missing.values()):
+            return True
+        if stats.get("duplicate_rows", 0) > 0:
+            return True
+        return False
+    except Exception:
+        return True  # assume issues exist if we can't parse
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Agent loop
@@ -93,39 +132,58 @@ def run_agent_on_task(task_id: int, client: OpenAI):
 
     max_steps = obs["max_steps"]
     conversation = []
-    final_score = 0.0
+    final_score = 0.001
     steps_taken = 0
+    prev_score = 0.0
+    stall_count = 0
+    last_action = None
 
     for step_num in range(max_steps):
         obs_text = json.dumps(obs, indent=2)
-        conversation.append({"role": "user", "content": f"Current observation:\n{obs_text}"})
 
-        try:
-            completion = client.chat.completions.create(
-                model=MODEL_NAME,
-                messages=[{"role": "system", "content": SYSTEM_PROMPT}] + conversation,
-                temperature=0.0,
-                max_tokens=300,
+        # Build user message with extra context on stalls
+        user_content = f"Current observation:\n{obs_text}"
+        if stall_count >= 2:
+            user_content += (
+                "\n\nWARNING: Your last actions did not improve the score. "
+                "Try a completely different action on a column you have not touched yet."
             )
-            raw = completion.choices[0].message.content.strip()
-        except Exception as exc:
-            print(f"WARN: LLM call failed at step {step_num + 1}: {exc}", flush=True)
+
+        conversation.append({"role": "user", "content": user_content})
+
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}] + conversation
+        raw = call_llm(client, messages)
+        if not raw:
             continue
 
         conversation.append({"role": "assistant", "content": raw})
+        action_dict = parse_action(raw)
+        if not action_dict:
+            print(f"WARN: Could not parse action from: {raw[:80]}", flush=True)
+            continue
 
-        try:
-            clean_raw = raw
-            if "```" in clean_raw:
-                clean_raw = clean_raw.split("```")[1]
-                if clean_raw.startswith("json\n"):
-                    clean_raw = clean_raw[5:]
-            action_dict = json.loads(clean_raw)
-        except (json.JSONDecodeError, IndexError):
+        action_type = action_dict.get("action_type")
+
+        # Guard: don't submit if obs still has issues
+        if action_type == "submit" and obs_has_issues(obs):
+            print("WARN: Agent tried to submit with issues remaining — blocking submit.", flush=True)
+            conversation.append({
+                "role": "user",
+                "content": "DO NOT submit yet. The observation still shows issues. Fix them first."
+            })
+            continue
+
+        # Guard: don't repeat same action twice in a row
+        if action_dict == last_action:
+            print("WARN: Repeated action blocked — forcing different approach.", flush=True)
+            conversation.append({
+                "role": "user",
+                "content": "That action was already tried. Choose a DIFFERENT action on a different column."
+            })
             continue
 
         steps_taken = step_num + 1
-        print(f"[STEP] step={steps_taken} action={action_dict.get('action_type')}", flush=True)
+        print(f"[STEP] step={steps_taken} action={action_type}", flush=True)
 
         try:
             step_resp = requests.post(
@@ -148,18 +206,24 @@ def run_agent_on_task(task_id: int, client: OpenAI):
 
         print(f"[STEP] step={steps_taken} reward={final_score}", flush=True)
 
+        # Track stalls
+        if final_score <= prev_score:
+            stall_count += 1
+        else:
+            stall_count = 0
+        prev_score = final_score
+        last_action = action_dict
+
         if done:
             break
 
     return max(0.001, min(0.999, final_score)), steps_taken
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    # 1. Build OpenAI client pointed at hackathon proxy
     try:
         client = make_openai_client()
         print("INFO: OpenAI client initialised successfully", flush=True)
@@ -167,7 +231,6 @@ def main():
         print(f"ERROR: OpenAI client init failed — {type(exc).__name__}: {exc}", flush=True)
         sys.exit(1)
 
-    # 2. Verify cleaning environment is reachable
     try:
         ping = requests.get(f"{ENV_BASE_URL}/", headers=HEADERS, timeout=15)
         ping.raise_for_status()
