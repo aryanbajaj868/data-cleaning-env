@@ -21,7 +21,7 @@ from openai import OpenAI
 # ─────────────────────────────────────────────────────────────────────────────
 
 # 1. Strict Hackathon Variables for the LLM
-API_BASE_URL: str = os.environ.get("API_BASE_URL")
+API_BASE_URL: str = os.environ.get("API_BASE_URL", "")
 MODEL_NAME: str = os.environ.get("MODEL_NAME", "gpt-4o-mini")
 HF_TOKEN: str = os.environ.get("HF_TOKEN", "")
 
@@ -31,8 +31,8 @@ ENV_URL: str = os.environ.get("ENV_URL", "https://aryanbajaj868-data-cleaning-en
 
 # Initialize the OpenAI Client strictly using the hackathon requirements
 client = OpenAI(
-    api_key=HF_TOKEN if HF_TOKEN else "dummy-key", 
-    base_url=API_BASE_URL
+    api_key=HF_TOKEN if HF_TOKEN else "dummy-key",
+    base_url=API_BASE_URL if API_BASE_URL else None,
 )
 
 # Extra headers for HF Space authentication if needed
